@@ -9,6 +9,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <utility>
 
 using JobID = uint64_t;
 
@@ -59,7 +60,7 @@ public:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    template <typename F, typename... Args>
+   template <typename F, typename... Args>
     auto submit(Priority priority, F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
@@ -80,12 +81,43 @@ public:
     }
 
     // Overload: no priority given -> defaults to Normal.
-    // Keeps old-style calls (from Phase 1 tests) compiling unchanged.
     template <typename F, typename... Args>
     auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         return submit(Priority::Normal, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
+    // Overload: priority + dependencies -> returns {JobID, future}.
+    template <typename F, typename... Args>
+    auto submit(Priority priority, const std::vector<JobID>& dependsOn, F&& f, Args&&... args)
+        -> std::pair<JobID, std::future<std::invoke_result_t<F, Args...>>> {
+        using ReturnType = std::invoke_result_t<F, Args...>;
+
+        auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+            std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+
+        std::future<ReturnType> result = task->get_future();
+
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (stopping_) {
+            throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
+        }
+
+        JobID id = nextJobId_++;
+        std::function<void()> wrappedTask = [task]() { (*task)(); };
+
+        if (dependsOn.empty()) {
+            tasks_.push(PrioritizedTask{priority, std::move(wrappedTask)});
+            condition_.notify_one();
+        } else {
+            pendingJobs_[id] = PendingJob{priority, std::move(wrappedTask),
+                                          static_cast<int>(dependsOn.size())};
+            for (JobID dep : dependsOn) {
+                dependents_[dep].push_back(id);
+            }
+        }
+
+        return {id, std::move(result)};
+    }
 private:
     void workerLoop() {
         for (;;) {
