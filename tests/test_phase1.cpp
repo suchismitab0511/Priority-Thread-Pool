@@ -78,10 +78,36 @@ void test_exception_propagation() {
     std::cout << "test_exception_propagation passed\n";
 }
 
+#include <chrono>
+
+void test_clean_shutdown() {
+    auto start = std::chrono::steady_clock::now();
+
+    {
+        ThreadPool pool(4);
+        // Queue 1000 jobs that each take a tiny bit of time,
+        // then immediately let the pool go out of scope while
+        // most of them are still waiting.
+        for (int i = 0; i < 1000; ++i) {
+            pool.submit([] {
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            });
+        }
+        // pool destructs HERE — while jobs are still pending.
+    }
+
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    // If it hung, this line would never even be reached.
+    // The 5-second bound is generous — this should finish in well under 1 second.
+    assert(elapsed < std::chrono::seconds(5));
+    std::cout << "test_clean_shutdown passed\n";
+}
+
 int main() {
     test_basic_correctness();
     test_concurrent_submission();
     test_exception_propagation();
-    std::cout << "Phase 1, Step 7 tests passed.\n";
+    test_clean_shutdown();
+    std::cout << "Phase 1, Step 8 tests passed.\n";
     return 0;
 }
