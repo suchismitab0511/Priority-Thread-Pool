@@ -5,6 +5,7 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <stdexcept>
 
 // Test 1: single-threaded submission (main thread only), 100k jobs.
 // Checks that the pool's worker side (workerLoop, condition_ signaling,
@@ -57,9 +58,30 @@ void test_concurrent_submission() {
     std::cout << "test_concurrent_submission passed (count=" << counter.load() << ")\n";
 }
 
+void test_exception_propagation() {
+    ThreadPool pool(2);
+
+    auto f = pool.submit([]() -> int {
+        throw std::runtime_error("task failed on purpose");
+        return 0; // unreachable, but keeps the lambda's return type explicit
+    });
+
+    bool caught = false;
+    try {
+        f.get();
+    } catch (const std::runtime_error& e) {
+        caught = true;
+        assert(std::string(e.what()) == "task failed on purpose");
+    }
+
+    assert(caught);
+    std::cout << "test_exception_propagation passed\n";
+}
+
 int main() {
     test_basic_correctness();
     test_concurrent_submission();
-    std::cout << "Phase 1, Step 6 tests passed.\n";
+    test_exception_propagation();
+    std::cout << "Phase 1, Step 7 tests passed.\n";
     return 0;
 }
