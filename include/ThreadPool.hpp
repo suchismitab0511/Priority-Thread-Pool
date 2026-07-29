@@ -9,6 +9,25 @@
 #include <thread>
 #include <vector>
 
+enum class Priority : int {
+    Low = 0,
+    Normal = 1,
+    High = 2
+};
+
+struct PrioritizedTask {
+    Priority priority;
+    std::function<void()> task;
+
+    // Used by std::priority_queue to decide ordering.
+    // std::priority_queue is a MAX-heap: operator< here means
+    // "this is LOWER priority than other" so that higher Priority
+    // values naturally end up at the top.
+    bool operator<(const PrioritizedTask& other) const {
+        return priority < other.priority;
+    }
+};
+
 class ThreadPool {
 public:
     explicit ThreadPool(size_t numThreads) {
@@ -38,7 +57,7 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     template <typename F, typename... Args>
-    auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
+    auto submit(Priority priority, F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
         auto task = std::make_shared<std::packaged_task<ReturnType()>>(
@@ -50,34 +69,41 @@ public:
             std::lock_guard<std::mutex> lock(queueMutex_);
             if (stopping_) {
                 throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
-            }
-            tasks_.emplace([task]() { (*task)(); });
+        }
+            tasks_.push(PrioritizedTask{priority, [task]() { (*task)(); }});
         }
         condition_.notify_one();
         return result;
     }
 
-private:
-    void workerLoop() {
-        for (;;) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(queueMutex_);
-                condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
-
-                if (tasks_.empty()) {
-                    return;
-                }
-
-                task = std::move(tasks_.front());
-                tasks_.pop();
-            }
-            task();
-        }
+    // Overload: no priority given -> defaults to Normal.
+    // Keeps old-style calls (from Phase 1 tests) compiling unchanged.
+    template <typename F, typename... Args>
+    auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
+        return submit(Priority::Normal, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
+private:
+   void workerLoop() {
+    for (;;) {
+        std::function<void()> task;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+
+            if (tasks_.empty()) {
+                return;
+            }
+
+            task = std::move(tasks_.top().task);
+            tasks_.pop();
+        }
+        task();
+    }
+}
+
     std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
+    std::priority_queue<PrioritizedTask> tasks_;
     std::mutex queueMutex_;
     std::condition_variable condition_;
     bool stopping_ = false;
