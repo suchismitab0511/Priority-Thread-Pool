@@ -7,7 +7,10 @@
 #include <queue>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+
+using JobID = uint64_t;
 
 enum class Priority : int {
     Low = 0,
@@ -69,7 +72,7 @@ public:
             std::lock_guard<std::mutex> lock(queueMutex_);
             if (stopping_) {
                 throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
-        }
+            }
             tasks_.push(PrioritizedTask{priority, [task]() { (*task)(); }});
         }
         condition_.notify_one();
@@ -84,27 +87,47 @@ public:
     }
 
 private:
-   void workerLoop() {
-    for (;;) {
-        std::function<void()> task;
-        {
-            std::unique_lock<std::mutex> lock(queueMutex_);
-            condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+    void workerLoop() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex_);
+                condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
 
-            if (tasks_.empty()) {
-                return;
+                if (tasks_.empty()) {
+                    return;
+                }
+
+                task = std::move(tasks_.top().task);
+                tasks_.pop();
             }
-
-            task = std::move(tasks_.top().task);
-            tasks_.pop();
+            task();
         }
-        task();
     }
-}
+
+    // Tracks a job that's waiting on dependencies — not yet in the
+    // runnable priority queue. Kept separate from PrioritizedTask so the
+    // priority queue only ever holds jobs that are already runnable.
+    struct PendingJob {
+        Priority priority;
+        std::function<void()> task;
+        int remainingDependencies;
+    };
 
     std::vector<std::thread> workers_;
     std::priority_queue<PrioritizedTask> tasks_;
     std::mutex queueMutex_;
     std::condition_variable condition_;
     bool stopping_ = false;
+
+    // Phase 4: dependency tracking state.
+    JobID nextJobId_ = 0;
+
+    // Jobs still waiting on at least one dependency to finish.
+    std::unordered_map<JobID, PendingJob> pendingJobs_;
+
+    // Reverse index: for each job, who depends on it? When jobId finishes,
+    // we look here to find jobs whose remainingDependencies count needs
+    // decrementing.
+    std::unordered_map<JobID, std::vector<JobID>> dependents_;
 };
