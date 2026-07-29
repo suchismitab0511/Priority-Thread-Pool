@@ -6,6 +6,7 @@
 #include <thread>
 #include <vector>
 #include <stdexcept>
+#include <future>
 
 // Test 1: single-threaded submission (main thread only), 100k jobs.
 // Checks that the pool's worker side (workerLoop, condition_ signaling,
@@ -103,11 +104,50 @@ void test_clean_shutdown() {
     std::cout << "test_clean_shutdown passed\n";
 }
 
+void test_priority_ordering() {
+    ThreadPool pool(1); // single thread: forces strict, observable ordering
+    std::vector<Priority> executionOrder;
+    std::mutex orderMutex;
+
+    // Block the only worker thread with a task that waits on a signal,
+    // so nothing else can start running while we queue the real tasks.
+    std::promise<void> releaseSignal;
+    std::shared_future<void> releaseFuture(releaseSignal.get_future());
+
+    pool.submit(Priority::Normal, [releaseFuture] {
+        releaseFuture.wait(); // worker thread parks here until we say go
+    });
+
+    // Now queue Low, then High, then Normal, deliberately out of priority order.
+    auto record = [&](Priority p) {
+        std::lock_guard<std::mutex> lock(orderMutex);
+        executionOrder.push_back(p);
+    };
+
+    auto fLow = pool.submit(Priority::Low, [&record] { record(Priority::Low); });
+    auto fHigh = pool.submit(Priority::High, [&record] { record(Priority::High); });
+    auto fNormal = pool.submit(Priority::Normal, [&record] { record(Priority::Normal); });
+
+    releaseSignal.set_value(); // let the worker proceed to the real queue
+
+    fLow.get();
+    fHigh.get();
+    fNormal.get();
+
+    assert(executionOrder.size() == 3);
+    assert(executionOrder[0] == Priority::High);
+    assert(executionOrder[1] == Priority::Normal);
+    assert(executionOrder[2] == Priority::Low);
+
+    std::cout << "test_priority_ordering passed (High -> Normal -> Low confirmed)\n";
+}
+
 int main() {
     test_basic_correctness();
     test_concurrent_submission();
     test_exception_propagation();
     test_clean_shutdown();
-    std::cout << "Phase 1, Step 8 tests passed.\n";
+    test_priority_ordering();
+    std::cout << "Phase 3, Step 4 test passed.\n";
     return 0;
 }
