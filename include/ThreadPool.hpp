@@ -22,6 +22,7 @@ enum class Priority : int {
 struct PrioritizedTask {
     Priority priority;
     std::function<void()> task;
+    JobID id; // needed so workerLoop can report completion
 
     // Used by std::priority_queue to decide ordering.
     // std::priority_queue is a MAX-heap: operator< here means
@@ -74,7 +75,7 @@ public:
             if (stopping_) {
                 throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
             }
-            tasks_.push(PrioritizedTask{priority, [task]() { (*task)(); }});
+            tasks_.push(PrioritizedTask{priority, [task]() { (*task)(); }, nextJobId_++});
         }
         condition_.notify_one();
         return result;
@@ -106,7 +107,7 @@ public:
         std::function<void()> wrappedTask = [task]() { (*task)(); };
 
         if (dependsOn.empty()) {
-            tasks_.push(PrioritizedTask{priority, std::move(wrappedTask)});
+            tasks_.push(PrioritizedTask{priority, std::move(wrappedTask), id});
             condition_.notify_one();
         } else {
             pendingJobs_[id] = PendingJob{priority, std::move(wrappedTask),
@@ -119,23 +120,54 @@ public:
         return {id, std::move(result)};
     }
 private:
-    void workerLoop() {
-        for (;;) {
-            std::function<void()> task;
-            {
-                std::unique_lock<std::mutex> lock(queueMutex_);
-                condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+    // Called after a job finishes. Checks who was waiting on it, decrements
+    // their remaining-dependency count, and promotes any that hit zero into
+    // the runnable queue. Must be called while holding queueMutex_.
+    void onJobCompleted(JobID completedId) {
+        auto it = dependents_.find(completedId);
+        if (it == dependents_.end()) {
+            return; // nothing depended on this job
+        }   
 
-                if (tasks_.empty()) {
-                    return;
-                }
+        for (JobID waitingId : it->second) {
+            auto pendingIt = pendingJobs_.find(waitingId);
+            if (pendingIt == pendingJobs_.end()) continue;
 
-                task = std::move(tasks_.top().task);
-                tasks_.pop();
+            pendingIt->second.remainingDependencies--;
+            if (pendingIt->second.remainingDependencies == 0) {
+            // All dependencies satisfied -> promote to runnable queue.
+                tasks_.push(PrioritizedTask{pendingIt->second.priority,
+                                        std::move(pendingIt->second.task),
+                                        waitingId});
+                pendingJobs_.erase(pendingIt);
             }
-            task();
         }
+        dependents_.erase(it);
     }
+    void workerLoop() {
+    for (;;) {
+        std::function<void()> task;
+        JobID completedId;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex_);
+            condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
+
+            if (tasks_.empty()) {
+                return;
+            }
+
+            completedId = tasks_.top().id;
+            task = std::move(tasks_.top().task);
+            tasks_.pop();
+        }
+        task();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            onJobCompleted(completedId);
+        }
+        condition_.notify_one(); // in case a promoted job needs a worker
+    }
+}
 
     // Tracks a job that's waiting on dependencies — not yet in the
     // runnable priority queue. Kept separate from PrioritizedTask so the
