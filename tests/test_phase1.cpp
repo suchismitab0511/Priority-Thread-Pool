@@ -142,12 +142,37 @@ void test_priority_ordering() {
     std::cout << "test_priority_ordering passed (High -> Normal -> Low confirmed)\n";
 }
 
+void test_job_dependencies() {
+    ThreadPool pool(4);
+    std::atomic<bool> jobACompleted{false};
+    std::atomic<bool> orderWasCorrect{false};
+
+    auto [idA, futureA] = pool.submit(Priority::Normal, {},
+        [&jobACompleted] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            jobACompleted.store(true);
+        });
+
+    auto [idB, futureB] = pool.submit(Priority::Normal, std::vector<JobID>{idA},
+        [&jobACompleted, &orderWasCorrect] {
+            // If this runs before A finishes, jobACompleted will still be false.
+            orderWasCorrect.store(jobACompleted.load());
+        });
+
+    futureA.get();
+    futureB.get();
+
+    assert(orderWasCorrect.load());
+    std::cout << "test_job_dependencies passed (B correctly waited for A)\n";
+}
+
 int main() {
     test_basic_correctness();
     test_concurrent_submission();
     test_exception_propagation();
     test_clean_shutdown();
     test_priority_ordering();
-    std::cout << "Phase 3, Step 4 test passed.\n";
+    test_job_dependencies();
+    std::cout << "Phase 4, Step 5 test passed.\n";
     return 0;
 }
