@@ -1,15 +1,18 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
-#include <vector>
 #include <utility>
+#include <vector>
 
 using JobID = uint64_t;
 
@@ -22,12 +25,8 @@ enum class Priority : int {
 struct PrioritizedTask {
     Priority priority;
     std::function<void()> task;
-    JobID id; // needed so workerLoop can report completion
+    JobID id;
 
-    // Used by std::priority_queue to decide ordering.
-    // std::priority_queue is a MAX-heap: operator< here means
-    // "this is LOWER priority than other" so that higher Priority
-    // values naturally end up at the top.
     bool operator<(const PrioritizedTask& other) const {
         return priority < other.priority;
     }
@@ -39,18 +38,20 @@ public:
         if (numThreads == 0) {
             throw std::invalid_argument("ThreadPool requires at least 1 thread");
         }
+
+        workerQueues_.reserve(numThreads);
+        for (size_t i = 0; i < numThreads; ++i) {
+            workerQueues_.push_back(std::make_unique<WorkerQueue>());
+        }
+
         workers_.reserve(numThreads);
         for (size_t i = 0; i < numThreads; ++i) {
-            workers_.emplace_back([this] { workerLoop(); });
+            workers_.emplace_back([this, i] { workerLoop(i); });
         }
     }
 
     ~ThreadPool() {
-        {
-            std::lock_guard<std::mutex> lock(queueMutex_);
-            stopping_ = true;
-        }
-        condition_.notify_all();
+        stopping_.store(true);
         for (auto& worker : workers_) {
             if (worker.joinable()) {
                 worker.join();
@@ -61,7 +62,8 @@ public:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-   template <typename F, typename... Args>
+    // Overload 1: priority, no dependencies.
+    template <typename F, typename... Args>
     auto submit(Priority priority, F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
@@ -70,24 +72,28 @@ public:
 
         std::future<ReturnType> result = task->get_future();
 
-        {
-            std::lock_guard<std::mutex> lock(queueMutex_);
-            if (stopping_) {
-                throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
-            }
-            tasks_.push(PrioritizedTask{priority, [task]() { (*task)(); }, nextJobId_++});
+        if (stopping_.load()) {
+            throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
         }
-        condition_.notify_one();
+
+        size_t index = nextQueueIndex_.fetch_add(1) % workerQueues_.size();
+        JobID id = 0; // plain submit doesn't track dependency-relevant IDs yet (known gap)
+
+        {
+            std::lock_guard<std::mutex> lock(workerQueues_[index]->mutex);
+            workerQueues_[index]->queue.push(PrioritizedTask{priority, [task]() { (*task)(); }, id});
+        }
+
         return result;
     }
 
-    // Overload: no priority given -> defaults to Normal.
+    // Overload 2: no priority given -> defaults to Normal.
     template <typename F, typename... Args>
     auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
         return submit(Priority::Normal, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
-    // Overload: priority + dependencies -> returns {JobID, future}.
+    // Overload 3: priority + dependencies -> returns {JobID, future}.
     template <typename F, typename... Args>
     auto submit(Priority priority, const std::vector<JobID>& dependsOn, F&& f, Args&&... args)
         -> std::pair<JobID, std::future<std::invoke_result_t<F, Args...>>> {
@@ -98,17 +104,18 @@ public:
 
         std::future<ReturnType> result = task->get_future();
 
-        std::lock_guard<std::mutex> lock(queueMutex_);
-        if (stopping_) {
+        if (stopping_.load()) {
             throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
         }
 
+        std::lock_guard<std::mutex> lock(idMutex_);
         JobID id = nextJobId_++;
         std::function<void()> wrappedTask = [task]() { (*task)(); };
 
         if (dependsOn.empty()) {
-            tasks_.push(PrioritizedTask{priority, std::move(wrappedTask), id});
-            condition_.notify_one();
+            size_t index = nextQueueIndex_.fetch_add(1) % workerQueues_.size();
+            std::lock_guard<std::mutex> qlock(workerQueues_[index]->mutex);
+            workerQueues_[index]->queue.push(PrioritizedTask{priority, std::move(wrappedTask), id});
         } else {
             pendingJobs_[id] = PendingJob{priority, std::move(wrappedTask),
                                           static_cast<int>(dependsOn.size())};
@@ -119,15 +126,30 @@ public:
 
         return {id, std::move(result)};
     }
+
 private:
-    // Called after a job finishes. Checks who was waiting on it, decrements
-    // their remaining-dependency count, and promotes any that hit zero into
-    // the runnable queue. Must be called while holding queueMutex_.
+    // One of these per worker thread. Each has its own queue + own lock,
+    // so a thread accessing its own queue doesn't contend with other
+    // threads accessing theirs — contention only happens during stealing.
+    struct WorkerQueue {
+        std::priority_queue<PrioritizedTask> queue;
+        std::mutex mutex;
+    };
+
+    // Tracks a job that's waiting on dependencies — not yet runnable.
+    struct PendingJob {
+        Priority priority;
+        std::function<void()> task;
+        int remainingDependencies;
+    };
+
     void onJobCompleted(JobID completedId) {
+        std::lock_guard<std::mutex> lock(idMutex_);
+
         auto it = dependents_.find(completedId);
         if (it == dependents_.end()) {
-            return; // nothing depended on this job
-        }   
+            return;
+        }
 
         for (JobID waitingId : it->second) {
             auto pendingIt = pendingJobs_.find(waitingId);
@@ -135,63 +157,71 @@ private:
 
             pendingIt->second.remainingDependencies--;
             if (pendingIt->second.remainingDependencies == 0) {
-            // All dependencies satisfied -> promote to runnable queue.
-                tasks_.push(PrioritizedTask{pendingIt->second.priority,
-                                        std::move(pendingIt->second.task),
-                                        waitingId});
+                size_t index = nextQueueIndex_.fetch_add(1) % workerQueues_.size();
+                {
+                    std::lock_guard<std::mutex> qlock(workerQueues_[index]->mutex);
+                    workerQueues_[index]->queue.push(PrioritizedTask{
+                        pendingIt->second.priority,
+                        std::move(pendingIt->second.task),
+                        waitingId});
+                }
                 pendingJobs_.erase(pendingIt);
             }
         }
         dependents_.erase(it);
     }
-    void workerLoop() {
-    for (;;) {
-        std::function<void()> task;
-        JobID completedId;
-        {
-            std::unique_lock<std::mutex> lock(queueMutex_);
-            condition_.wait(lock, [this] { return stopping_ || !tasks_.empty(); });
 
-            if (tasks_.empty()) {
-                return;
+    void workerLoop(size_t myIndex) {
+        for (;;) {
+            std::function<void()> task;
+            JobID completedId;
+            bool gotTask = false;
+
+            {
+                std::unique_lock<std::mutex> lock(workerQueues_[myIndex]->mutex);
+                if (!workerQueues_[myIndex]->queue.empty()) {
+                    completedId = workerQueues_[myIndex]->queue.top().id;
+                    task = std::move(workerQueues_[myIndex]->queue.top().task);
+                    workerQueues_[myIndex]->queue.pop();
+                    gotTask = true;
+                }
             }
 
-            completedId = tasks_.top().id;
-            task = std::move(tasks_.top().task);
-            tasks_.pop();
-        }
-        task();
-        {
-            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!gotTask) {
+                for (size_t offset = 1; offset < workerQueues_.size(); ++offset) {
+                    size_t victim = (myIndex + offset) % workerQueues_.size();
+                    std::unique_lock<std::mutex> lock(workerQueues_[victim]->mutex);
+                    if (!workerQueues_[victim]->queue.empty()) {
+                        completedId = workerQueues_[victim]->queue.top().id;
+                        task = std::move(workerQueues_[victim]->queue.top().task);
+                        workerQueues_[victim]->queue.pop();
+                        gotTask = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!gotTask) {
+                if (stopping_.load()) {
+                    return;
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                continue;
+            }
+
+            task();
             onJobCompleted(completedId);
         }
-        condition_.notify_one(); // in case a promoted job needs a worker
     }
-}
-
-    // Tracks a job that's waiting on dependencies — not yet in the
-    // runnable priority queue. Kept separate from PrioritizedTask so the
-    // priority queue only ever holds jobs that are already runnable.
-    struct PendingJob {
-        Priority priority;
-        std::function<void()> task;
-        int remainingDependencies;
-    };
 
     std::vector<std::thread> workers_;
-    std::priority_queue<PrioritizedTask> tasks_;
-    std::mutex queueMutex_;
-    std::condition_variable condition_;
-    bool stopping_ = false;
+    std::vector<std::unique_ptr<WorkerQueue>> workerQueues_;
+    std::atomic<size_t> nextQueueIndex_{0};
+    std::atomic<bool> stopping_{false};
 
-    // Phase 4: dependency tracking state.
+    // Phase 4: dependency tracking state (idMutex_ protects all three).
+    std::mutex idMutex_;
     JobID nextJobId_ = 0;
-
-    // Jobs still waiting on at least one dependency to finish.
     std::unordered_map<JobID, PendingJob> pendingJobs_;
-
-    // Reverse index: for each job, who depends on it? When jobId finishes,
-    // we look here to find jobs whose remainingDependencies count needs
-    // decrementing.
     std::unordered_map<JobID, std::vector<JobID>> dependents_;
 };
