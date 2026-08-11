@@ -31,6 +31,13 @@ struct PrioritizedTask {
         return priority < other.priority;
     }
 };
+// Returned by the dependency-aware submit() overload. A named struct instead
+// of std::pair so callers write job.id / job.future instead of .first / .second.
+template <typename T>
+struct Job {
+    JobID id;
+    std::future<T> future;
+};
 
 class ThreadPool {
 public:
@@ -62,9 +69,11 @@ public:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    // Overload 1: priority, no dependencies.
+    // Overload 1: priority, no dependencies. Returns {JobID, future} so the
+    // job can be referenced as a dependency by a later submit() call.
     template <typename F, typename... Args>
-    auto submit(Priority priority, F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
+    auto submit(Priority priority, F&& f, Args&&... args)
+        -> std::future<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
         auto task = std::make_shared<std::packaged_task<ReturnType()>>(
@@ -76,9 +85,13 @@ public:
             throw std::runtime_error("submit() called on a ThreadPool that is shutting down");
         }
 
-        size_t index = nextQueueIndex_.fetch_add(1) % workerQueues_.size();
-        JobID id = 0; // plain submit doesn't track dependency-relevant IDs yet (known gap)
+        JobID id;
+        {
+            std::lock_guard<std::mutex> lock(idMutex_);
+            id = nextJobId_++;
+        }
 
+        size_t index = nextQueueIndex_.fetch_add(1) % workerQueues_.size();
         {
             std::lock_guard<std::mutex> lock(workerQueues_[index]->mutex);
             workerQueues_[index]->queue.push(PrioritizedTask{priority, [task]() { (*task)(); }, id});
@@ -87,16 +100,18 @@ public:
         return result;
     }
 
-    // Overload 2: no priority given -> defaults to Normal.
+    // Overload 2: no priority given -> defaults to Normal. Also returns
+    // {JobID, future} since it forwards to Overload 1.
     template <typename F, typename... Args>
-    auto submit(F&& f, Args&&... args) -> std::future<std::invoke_result_t<F, Args...>> {
+    auto submit(F&& f, Args&&... args)
+        -> std::future<std::invoke_result_t<F, Args...>> {
         return submit(Priority::Normal, std::forward<F>(f), std::forward<Args>(args)...);
     }
 
     // Overload 3: priority + dependencies -> returns {JobID, future}.
     template <typename F, typename... Args>
     auto submit(Priority priority, const std::vector<JobID>& dependsOn, F&& f, Args&&... args)
-        -> std::pair<JobID, std::future<std::invoke_result_t<F, Args...>>> {
+        -> Job<std::invoke_result_t<F, Args...>> {
         using ReturnType = std::invoke_result_t<F, Args...>;
 
         auto task = std::make_shared<std::packaged_task<ReturnType()>>(
@@ -219,7 +234,7 @@ private:
     std::atomic<size_t> nextQueueIndex_{0};
     std::atomic<bool> stopping_{false};
 
-    // Phase 4: dependency tracking state (idMutex_ protects all three).
+    // Dependency tracking state (idMutex_ protects all three).
     std::mutex idMutex_;
     JobID nextJobId_ = 0;
     std::unordered_map<JobID, PendingJob> pendingJobs_;
