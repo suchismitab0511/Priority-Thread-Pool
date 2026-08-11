@@ -1,17 +1,19 @@
 #include "ThreadPool.hpp"
+#include "test_utils.hpp"
 
 #include <atomic>
-#include <cassert>
+#include <chrono>
+#include <future>
 #include <iostream>
+#include <set>
+#include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
-#include <stdexcept>
-#include <future>
-#include <set>
 
 // Test 1: single-threaded submission (main thread only), 100k jobs.
-// Checks that the pool's worker side (workerLoop, condition_ signaling,
-// task execution) is correct.
+// Checks that the pool's worker side (workerLoop, task dequeue, execution)
+// is correct when there is exactly one producer.
 void test_basic_correctness() {
     ThreadPool pool(4);
     std::atomic<int> counter{0};
@@ -26,7 +28,7 @@ void test_basic_correctness() {
     }
     for (auto& f : futures) f.get();
 
-    assert(counter.load() == N);
+    REQUIRE_EQ(counter.load(), N);
     std::cout << "test_basic_correctness passed (count=" << counter.load() << ")\n";
 }
 
@@ -51,15 +53,15 @@ void test_concurrent_submission() {
             });
         }
         for (auto& t : producerThreads) t.join();
-        // pool destructs here (end of scope) — destructor drains remaining
-        // tasks and joins workers, so ALL jobs are guaranteed done by the
-        // time we exit this block.
+        // pool destructs here (end of scope) — destructor joins workers.
     }
 
-    assert(counter.load() == producers * jobsPerProducer);
+    REQUIRE_EQ(counter.load(), producers * jobsPerProducer);
     std::cout << "test_concurrent_submission passed (count=" << counter.load() << ")\n";
 }
 
+// Test 3: an exception thrown inside a task must not kill the worker thread;
+// it must be captured by packaged_task and rethrown at future::get().
 void test_exception_propagation() {
     ThreadPool pool(2);
 
@@ -73,23 +75,21 @@ void test_exception_propagation() {
         f.get();
     } catch (const std::runtime_error& e) {
         caught = true;
-        assert(std::string(e.what()) == "task failed on purpose");
+        REQUIRE(std::string(e.what()) == "task failed on purpose");
     }
 
-    assert(caught);
+    REQUIRE(caught);
     std::cout << "test_exception_propagation passed\n";
 }
 
-#include <chrono>
-
+// Test 4: destroying the pool with work still queued must terminate, not hang.
 void test_clean_shutdown() {
     auto start = std::chrono::steady_clock::now();
 
     {
         ThreadPool pool(4);
-        // Queue 1000 jobs that each take a tiny bit of time,
-        // then immediately let the pool go out of scope while
-        // most of them are still waiting.
+        // Queue 1000 jobs that each take a tiny bit of time, then immediately
+        // let the pool go out of scope while most are still waiting.
         for (int i = 0; i < 1000; ++i) {
             pool.submit([] {
                 std::this_thread::sleep_for(std::chrono::microseconds(100));
@@ -99,32 +99,35 @@ void test_clean_shutdown() {
     }
 
     auto elapsed = std::chrono::steady_clock::now() - start;
-    // If it hung, this line would never even be reached.
-    // The 5-second bound is generous — this should finish in well under 1 second.
-    assert(elapsed < std::chrono::seconds(5));
+    // If it hung, this line would never be reached at all.
+    REQUIRE(elapsed < std::chrono::seconds(5));
     std::cout << "test_clean_shutdown passed\n";
 }
 
+// Test 5: higher-priority tasks run first.
+// NOTE: uses 1 worker thread, which is the only configuration where global
+// priority ordering is actually guaranteed. With N threads there are N
+// independent queues, so this test does not prove global ordering.
 void test_priority_ordering() {
-    ThreadPool pool(1); // single thread: forces strict, observable ordering
+    ThreadPool pool(1);
     std::vector<Priority> executionOrder;
     std::mutex orderMutex;
 
-    // Block the only worker thread with a task that waits on a signal,
-    // so nothing else can start running while we queue the real tasks.
+    // Block the only worker with a task that waits on a signal, so nothing
+    // can start running while we queue the real tasks.
     std::promise<void> releaseSignal;
     std::shared_future<void> releaseFuture(releaseSignal.get_future());
 
     pool.submit(Priority::Normal, [releaseFuture] {
-        releaseFuture.wait(); // worker thread parks here until we say go
+        releaseFuture.wait();
     });
 
-    // Now queue Low, then High, then Normal, deliberately out of priority order.
     auto record = [&](Priority p) {
         std::lock_guard<std::mutex> lock(orderMutex);
         executionOrder.push_back(p);
     };
 
+    // Queue Low, then High, then Normal — deliberately out of priority order.
     auto fLow = pool.submit(Priority::Low, [&record] { record(Priority::Low); });
     auto fHigh = pool.submit(Priority::High, [&record] { record(Priority::High); });
     auto fNormal = pool.submit(Priority::Normal, [&record] { record(Priority::Normal); });
@@ -135,14 +138,16 @@ void test_priority_ordering() {
     fHigh.get();
     fNormal.get();
 
-    assert(executionOrder.size() == 3);
-    assert(executionOrder[0] == Priority::High);
-    assert(executionOrder[1] == Priority::Normal);
-    assert(executionOrder[2] == Priority::Low);
+    REQUIRE_EQ(executionOrder.size(), 3u);
+    REQUIRE(executionOrder[0] == Priority::High);
+    REQUIRE(executionOrder[1] == Priority::Normal);
+    REQUIRE(executionOrder[2] == Priority::Low);
 
     std::cout << "test_priority_ordering passed (High -> Normal -> Low confirmed)\n";
 }
 
+// Test 6: a job with a declared dependency must not run until that dep finishes.
+// WEAK: only passes reliably because A sleeps 50ms. See notes below.
 void test_job_dependencies() {
     ThreadPool pool(4);
     std::atomic<bool> jobACompleted{false};
@@ -156,16 +161,19 @@ void test_job_dependencies() {
 
     auto [idB, futureB] = pool.submit(Priority::Normal, std::vector<JobID>{idA},
         [&jobACompleted, &orderWasCorrect] {
-            // If this runs before A finishes, jobACompleted will still be false.
+            // If this runs before A finishes, jobACompleted is still false.
             orderWasCorrect.store(jobACompleted.load());
         });
 
     futureA.get();
     futureB.get();
 
-    assert(orderWasCorrect.load());
+    REQUIRE(orderWasCorrect.load());
     std::cout << "test_job_dependencies passed (B correctly waited for A)\n";
 }
+
+// Test 7: WEAK — see notes below. Tasks are round-robined across queues at
+// submit time, so multiple threads run work even with stealing disabled.
 void test_work_stealing() {
     ThreadPool pool(4);
     std::mutex threadIdMutex;
@@ -173,6 +181,7 @@ void test_work_stealing() {
 
     const int N = 200;
     std::vector<std::future<void>> futures;
+    futures.reserve(N);
     for (int i = 0; i < N; ++i) {
         futures.push_back(pool.submit([&threadIdMutex, &threadsUsed] {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -182,10 +191,7 @@ void test_work_stealing() {
     }
     for (auto& f : futures) f.get();
 
-    // With 4 worker threads and 200 tasks (each taking 5ms), if only one
-    // thread ever did any work, that's 1000ms of pure serial execution —
-    // and no stealing occurred. We expect multiple distinct thread IDs.
-    assert(threadsUsed.size() > 1);
+    REQUIRE(threadsUsed.size() > 1);
     std::cout << "test_work_stealing passed (" << threadsUsed.size()
               << " distinct threads participated)\n";
 }
@@ -198,6 +204,6 @@ int main() {
     test_priority_ordering();
     test_job_dependencies();
     test_work_stealing();
-    std::cout << "Phase 5, Step 7 test passed.\n";
+    std::cout << "All tests passed.\n";
     return 0;
 }
