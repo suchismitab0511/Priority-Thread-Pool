@@ -7,6 +7,7 @@
 #include <vector>
 #include <stdexcept>
 #include <future>
+#include <set>
 
 // Test 1: single-threaded submission (main thread only), 100k jobs.
 // Checks that the pool's worker side (workerLoop, condition_ signaling,
@@ -165,6 +166,29 @@ void test_job_dependencies() {
     assert(orderWasCorrect.load());
     std::cout << "test_job_dependencies passed (B correctly waited for A)\n";
 }
+void test_work_stealing() {
+    ThreadPool pool(4);
+    std::mutex threadIdMutex;
+    std::set<std::thread::id> threadsUsed;
+
+    const int N = 200;
+    std::vector<std::future<void>> futures;
+    for (int i = 0; i < N; ++i) {
+        futures.push_back(pool.submit([&threadIdMutex, &threadsUsed] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            std::lock_guard<std::mutex> lock(threadIdMutex);
+            threadsUsed.insert(std::this_thread::get_id());
+        }));
+    }
+    for (auto& f : futures) f.get();
+
+    // With 4 worker threads and 200 tasks (each taking 5ms), if only one
+    // thread ever did any work, that's 1000ms of pure serial execution —
+    // and no stealing occurred. We expect multiple distinct thread IDs.
+    assert(threadsUsed.size() > 1);
+    std::cout << "test_work_stealing passed (" << threadsUsed.size()
+              << " distinct threads participated)\n";
+}
 
 int main() {
     test_basic_correctness();
@@ -173,6 +197,7 @@ int main() {
     test_clean_shutdown();
     test_priority_ordering();
     test_job_dependencies();
-    std::cout << "Phase 4, Step 5 test passed.\n";
+    test_work_stealing();
+    std::cout << "Phase 5, Step 7 test passed.\n";
     return 0;
 }
